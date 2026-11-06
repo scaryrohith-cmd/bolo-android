@@ -1,0 +1,756 @@
+name: Build Bolo APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Write the app files
+        run: |
+          cat > settings.gradle.kts <<'BOLO_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Bolo"
+          include(":app")
+          BOLO_EOF
+          cat > build.gradle.kts <<'BOLO_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          BOLO_EOF
+          cat > gradle.properties <<'BOLO_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          BOLO_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'BOLO_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.bolo.translator"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.bolo.translator"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("com.google.mlkit:translate:17.0.3")
+          }
+          BOLO_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'BOLO_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Bolo"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          BOLO_EOF
+          mkdir -p app/src/main/java/com/bolo/translator
+          cat > app/src/main/java/com/bolo/translator/MainActivity.kt <<'BOLO_EOF'
+          package com.bolo.translator
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.media.AudioAttributes
+          import android.media.AudioDeviceInfo
+          import android.media.AudioManager
+          import android.media.MediaPlayer
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Spinner
+          import android.widget.TextView
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.nl.translate.TranslateLanguage
+          import com.google.mlkit.nl.translate.Translation
+          import com.google.mlkit.nl.translate.Translator
+          import com.google.mlkit.nl.translate.TranslatorOptions
+          import java.io.File
+          import java.util.Locale
+
+          /**
+           * Bolo: one ON/OFF button for a two-way spoken conversation.
+           *
+           * The other person's translation is played to the earphones.
+           * Your translation is played on the phone speaker.
+           */
+          class MainActivity : Activity() {
+
+              private data class Lang(val name: String, val tag: String, val ml: String)
+
+              private val langs = listOf(
+                  Lang("English", "en-IN", TranslateLanguage.ENGLISH),
+                  Lang("Hindi", "hi-IN", TranslateLanguage.HINDI),
+                  Lang("Tamil", "ta-IN", TranslateLanguage.TAMIL),
+                  Lang("Telugu", "te-IN", TranslateLanguage.TELUGU),
+                  Lang("Kannada", "kn-IN", TranslateLanguage.KANNADA),
+                  Lang("Bengali", "bn-IN", TranslateLanguage.BENGALI),
+                  Lang("Marathi", "mr-IN", TranslateLanguage.MARATHI),
+                  Lang("Gujarati", "gu-IN", TranslateLanguage.GUJARATI),
+                  Lang("Urdu", "ur-IN", TranslateLanguage.URDU),
+                  Lang("Spanish", "es-ES", TranslateLanguage.SPANISH),
+                  Lang("French", "fr-FR", TranslateLanguage.FRENCH),
+                  Lang("German", "de-DE", TranslateLanguage.GERMAN),
+                  Lang("Portuguese", "pt-BR", TranslateLanguage.PORTUGUESE),
+                  Lang("Russian", "ru-RU", TranslateLanguage.RUSSIAN),
+                  Lang("Arabic", "ar-SA", TranslateLanguage.ARABIC),
+                  Lang("Japanese", "ja-JP", TranslateLanguage.JAPANESE),
+                  Lang("Korean", "ko-KR", TranslateLanguage.KOREAN),
+                  Lang("Chinese", "zh-CN", TranslateLanguage.CHINESE)
+              )
+
+              private val ME = 0
+              private val THEM = 1
+
+              private val handler = Handler(Looper.getMainLooper())
+
+              private lateinit var meSpinner: Spinner
+              private lateinit var themSpinner: Spinner
+              private lateinit var powerBtn: Button
+              private lateinit var turnBtn: Button
+              private lateinit var statusView: TextView
+              private lateinit var logView: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var prefs: SharedPreferences
+              private lateinit var audio: AudioManager
+
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var recognizer: SpeechRecognizer? = null
+              private var player: MediaPlayer? = null
+              private val translators = arrayOfNulls<Translator>(2)
+
+              private var on = false
+              private var ready = false
+              private var turn = ME
+              private var session = 0
+              private var uttCounter = 0
+
+              // ---------------------------------------------------------------- setup
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(text: String): TextView = TextView(this).apply {
+                  this.text = text
+                  textSize = 12f
+                  setTextColor(Color.parseColor("#5B6B80"))
+                  setPadding(0, dp(12), 0, dp(2))
+              }
+
+              private fun makeSpinner(key: String, def: Int): Spinner {
+                  val sp = Spinner(this)
+                  sp.adapter = ArrayAdapter(
+                      this,
+                      android.R.layout.simple_spinner_dropdown_item,
+                      langs.map { it.name }
+                  )
+                  val stored = prefs.getInt(key, def)
+                  sp.setSelection(stored)
+                  sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                          val before = prefs.getInt(key, def)
+                          if (pos != before) {
+                              prefs.edit().putInt(key, pos).apply()
+                              if (on) powerOff("Languages changed. Tap the button to turn ON again.")
+                          }
+                          refreshTurnLabel()
+                      }
+
+                      override fun onNothingSelected(parent: AdapterView<*>?) {}
+                  }
+                  return sp
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  prefs = getSharedPreferences("bolo", Context.MODE_PRIVATE)
+                  audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(28), dp(16), dp(16))
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "Bolo"
+                      textSize = 30f
+                      setTypeface(null, Typeface.BOLD)
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "Other person's translation goes to your earphones. Your translation plays on the phone speaker."
+                      textSize = 13f
+                      setTextColor(Color.parseColor("#5B6B80"))
+                  })
+
+                  meSpinner = makeSpinner("me", 2)
+                  themSpinner = makeSpinner("them", 0)
+                  root.addView(label("YOU SPEAK"))
+                  root.addView(meSpinner)
+                  root.addView(label("OTHER PERSON SPEAKS"))
+                  root.addView(themSpinner)
+
+                  val swap = Button(this).apply {
+                      text = "Swap languages"
+                      isAllCaps = false
+                      setOnClickListener {
+                          val a = meSpinner.selectedItemPosition
+                          meSpinner.setSelection(themSpinner.selectedItemPosition)
+                          themSpinner.setSelection(a)
+                      }
+                  }
+                  root.addView(swap)
+
+                  scroll = ScrollView(this)
+                  logView = TextView(this).apply {
+                      textSize = 17f
+                      setPadding(0, dp(8), 0, dp(8))
+                      text = "Tap the big button to turn the conversation ON. Bolo listens to you first, translates, then listens to the other person. Tap again to turn it OFF.\n\n"
+                  }
+                  scroll.addView(logView)
+                  root.addView(scroll, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                  ))
+
+                  statusView = TextView(this).apply {
+                      textSize = 14f
+                      setTextColor(Color.parseColor("#5B6B80"))
+                      gravity = android.view.Gravity.CENTER
+                      setPadding(0, dp(4), 0, dp(4))
+                  }
+                  root.addView(statusView)
+
+                  turnBtn = Button(this).apply {
+                      isAllCaps = false
+                      textSize = 13f
+                      setOnClickListener { switchTurn() }
+                  }
+                  root.addView(turnBtn)
+
+                  powerBtn = Button(this).apply {
+                      isAllCaps = false
+                      textSize = 20f
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { togglePower() }
+                  }
+                  root.addView(powerBtn, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, dp(76)
+                  ))
+
+                  setContentView(root)
+
+                  tts = TextToSpeech(this) { status -> ttsReady = status == TextToSpeech.SUCCESS }
+
+                  updatePowerUi()
+                  refreshTurnLabel()
+                  status("Turned OFF. Tap the button to start.")
+              }
+
+              override fun onDestroy() {
+                  on = false
+                  session++
+                  destroyRecognizer()
+                  stopPlayback()
+                  closeTranslators()
+                  tts?.shutdown()
+                  super.onDestroy()
+              }
+
+              // ---------------------------------------------------------------- small UI helpers
+
+              private fun lang(who: Int): Lang =
+                  langs[(if (who == ME) meSpinner else themSpinner).selectedItemPosition]
+
+              private fun status(s: String) { statusView.text = s }
+
+              private fun addLog(s: String) {
+                  logView.append(s + "\n")
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              private fun updatePowerUi() {
+                  if (on) {
+                      powerBtn.text = "ON  ·  tap to turn OFF"
+                      powerBtn.setBackgroundColor(Color.parseColor("#D6372A"))
+                  } else {
+                      powerBtn.text = "Tap to turn ON"
+                      powerBtn.setBackgroundColor(Color.parseColor("#1B4FD8"))
+                  }
+              }
+
+              private fun refreshTurnLabel() {
+                  if (!::turnBtn.isInitialized) return
+                  val who = if (turn == ME) "You" else "Other person"
+                  val prefix = if (on) "Now listening for: " else "First speaker: "
+                  turnBtn.text = prefix + who + " · " + lang(turn).name + "  (tap to switch)"
+              }
+
+              // ---------------------------------------------------------------- ON / OFF
+
+              private fun togglePower() {
+                  if (on) {
+                      powerOff("Turned OFF. Tap the button to start.")
+                      return
+                  }
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                      return
+                  }
+                  powerOn()
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == 1) {
+                      if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                          powerOn()
+                      } else {
+                          status("Microphone permission is needed. Allow it in the phone's app settings.")
+                      }
+                  }
+              }
+
+              private fun makeTranslator(from: Lang, to: Lang): Translator {
+                  val opts = TranslatorOptions.Builder()
+                      .setSourceLanguage(from.ml)
+                      .setTargetLanguage(to.ml)
+                      .build()
+                  return Translation.getClient(opts)
+              }
+
+              private fun closeTranslators() {
+                  for (i in translators.indices) {
+                      try { translators[i]?.close() } catch (e: Exception) {}
+                      translators[i] = null
+                  }
+              }
+
+              private fun powerOn() {
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      status("Speech recognition is not available on this phone.")
+                      return
+                  }
+                  val me = lang(ME)
+                  val them = lang(THEM)
+                  if (me.ml == them.ml) {
+                      status("Choose two different languages.")
+                      return
+                  }
+                  on = true
+                  ready = false
+                  val my = ++session
+                  updatePowerUi()
+                  refreshTurnLabel()
+                  closeTranslators()
+                  translators[ME] = makeTranslator(me, them)
+                  translators[THEM] = makeTranslator(them, me)
+
+                  status("Preparing languages. This needs internet the first time…")
+                  val cond = DownloadConditions.Builder().build()
+                  translators[ME]!!.downloadModelIfNeeded(cond)
+                      .addOnSuccessListener {
+                          if (!on || my != session) return@addOnSuccessListener
+                          translators[THEM]!!.downloadModelIfNeeded(cond)
+                              .addOnSuccessListener {
+                                  if (on && my == session) {
+                                      ready = true
+                                      listen()
+                                  }
+                              }
+                              .addOnFailureListener {
+                                  if (on && my == session) {
+                                      powerOff("Couldn't download language data. Check your internet and try again.")
+                                  }
+                              }
+                      }
+                      .addOnFailureListener {
+                          if (on && my == session) {
+                              powerOff("Couldn't download language data. Check your internet and try again.")
+                          }
+                      }
+              }
+
+              private fun powerOff(message: String) {
+                  on = false
+                  ready = false
+                  session++
+                  destroyRecognizer()
+                  stopPlayback()
+                  try { tts?.stop() } catch (e: Exception) {}
+                  closeTranslators()
+                  updatePowerUi()
+                  refreshTurnLabel()
+                  status(message)
+              }
+
+              private fun switchTurn() {
+                  turn = 1 - turn
+                  refreshTurnLabel()
+                  if (on && ready) {
+                      session++
+                      destroyRecognizer()
+                      stopPlayback()
+                      try { tts?.stop() } catch (e: Exception) {}
+                      listen()
+                  }
+              }
+
+              // ---------------------------------------------------------------- listening
+
+              private fun destroyRecognizer() {
+                  val r = recognizer ?: return
+                  recognizer = null
+                  try { r.cancel() } catch (e: Exception) {}
+                  try { r.destroy() } catch (e: Exception) {}
+              }
+
+              private fun relisten(my: Int, delayMs: Long) {
+                  handler.postDelayed({
+                      if (on && ready && my == session) listen()
+                  }, delayMs)
+              }
+
+              private fun listen() {
+                  if (!on || !ready) return
+                  destroyRecognizer()
+                  val who = turn
+                  val my = ++session
+                  val l = lang(who)
+
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  recognizer = r
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onReadyForSpeech(params: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(rmsdB: Float) {}
+                      override fun onBufferReceived(buffer: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onEvent(eventType: Int, params: Bundle?) {}
+
+                      override fun onPartialResults(partialResults: Bundle?) {
+                          if (my != session) return
+                          val t = partialResults
+                              ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                              ?.firstOrNull()
+                          if (!t.isNullOrBlank()) status("Hearing: $t")
+                      }
+
+                      override fun onResults(results: Bundle?) {
+                          if (my != session) return
+                          val text = results
+                              ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                              ?.firstOrNull()
+                              ?.trim()
+                          if (text.isNullOrEmpty()) {
+                              relisten(my, 400)
+                          } else {
+                              handleSpeech(who, text, my)
+                          }
+                      }
+
+                      override fun onError(error: Int) {
+                          if (my != session) return
+                          when (error) {
+                              SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+                                  powerOff("Microphone permission is missing. Allow it in the phone's app settings.")
+                              SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED,
+                              SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ->
+                                  powerOff("This phone can't recognise " + l.name + " speech. Try another language.")
+                              SpeechRecognizer.ERROR_NETWORK,
+                              SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
+                              SpeechRecognizer.ERROR_SERVER -> {
+                                  status("Speech recognition needs internet. Trying again…")
+                                  relisten(my, 1500)
+                              }
+                              SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> relisten(my, 900)
+                              else -> relisten(my, 500)
+                          }
+                      }
+                  })
+
+                  val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, l.tag)
+                      putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                      putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+                  }
+                  val whoText = if (who == ME) "you" else "the other person"
+                  status("Listening to $whoText in ${l.name}…")
+                  refreshTurnLabel()
+                  try {
+                      r.startListening(intent)
+                  } catch (e: Exception) {
+                      relisten(my, 800)
+                  }
+              }
+
+              // ---------------------------------------------------------------- translate + speak
+
+              private fun handleSpeech(who: Int, text: String, my: Int) {
+                  val from = lang(who)
+                  val to = lang(1 - who)
+                  val whoName = if (who == ME) "You" else "Other person"
+                  addLog("$whoName (${from.name}): $text")
+                  status("Translating…")
+
+                  val translator = translators[who]
+                  if (translator == null) {
+                      nextTurn(who, my)
+                      return
+                  }
+                  translator.translate(text)
+                      .addOnSuccessListener { out ->
+                          if (!on || my != session) return@addOnSuccessListener
+                          addLog("→ ${to.name}: $out\n")
+                          // The other person's words go to the earphones. Yours go to the phone speaker.
+                          val toEarphones = (who == THEM)
+                          status(if (toEarphones) "Playing in your earphones…" else "Playing on the phone speaker…")
+                          speak(out, to, toEarphones, my) { nextTurn(who, my) }
+                      }
+                      .addOnFailureListener {
+                          if (!on || my != session) return@addOnFailureListener
+                          addLog("(translation failed)\n")
+                          status("Translation failed. Check the language data and try again.")
+                          nextTurn(who, my)
+                      }
+              }
+
+              private fun nextTurn(who: Int, my: Int) {
+                  if (!on || my != session) return
+                  turn = 1 - who
+                  refreshTurnLabel()
+                  relisten(my, 600)
+              }
+
+              private fun speak(text: String, lang: Lang, toEarphones: Boolean, my: Int, done: () -> Unit) {
+                  val t = tts
+                  if (t == null || !ttsReady) {
+                      status("Voice engine is not ready.")
+                      done()
+                      return
+                  }
+                  val res = t.setLanguage(Locale.forLanguageTag(lang.tag))
+                  if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                      status("No " + lang.name + " voice installed. Add it in Settings > Text-to-speech.")
+                      done()
+                      return
+                  }
+                  uttCounter++
+                  val id = "u$uttCounter"
+                  val file = File(cacheDir, "bolo_tts_$uttCounter.wav")
+                  t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(utteranceId: String?) {}
+
+                      override fun onDone(utteranceId: String?) {
+                          runOnUiThread {
+                              if (on && my == session) play(file, toEarphones, done) else file.delete()
+                          }
+                      }
+
+                      @Deprecated("Deprecated in Java")
+                      override fun onError(utteranceId: String?) {
+                          runOnUiThread {
+                              file.delete()
+                              if (on && my == session) done()
+                          }
+                      }
+                  })
+                  val r = t.synthesizeToFile(text, Bundle(), file, id)
+                  if (r != TextToSpeech.SUCCESS) {
+                      file.delete()
+                      done()
+                  }
+              }
+
+              private fun findOutput(toEarphones: Boolean): AudioDeviceInfo? {
+                  val order: List<Int> = if (toEarphones) {
+                      val l = mutableListOf(
+                          AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                          AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                          AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                          AudioDeviceInfo.TYPE_USB_HEADSET,
+                          AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                      )
+                      if (Build.VERSION.SDK_INT >= 31) l.add(AudioDeviceInfo.TYPE_BLE_HEADSET)
+                      l
+                  } else {
+                      listOf(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+                  }
+                  val devices = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                  for (type in order) {
+                      val d = devices.firstOrNull { it.type == type }
+                      if (d != null) return d
+                  }
+                  return null
+              }
+
+              private fun stopPlayback() {
+                  val p = player ?: return
+                  player = null
+                  try {
+                      p.setOnCompletionListener(null)
+                      p.setOnErrorListener(null)
+                      p.stop()
+                  } catch (e: Exception) {}
+                  try { p.release() } catch (e: Exception) {}
+              }
+
+              private fun play(file: File, toEarphones: Boolean, done: () -> Unit) {
+                  val mp = MediaPlayer()
+                  player = mp
+                  try {
+                      mp.setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                              .build()
+                      )
+                      mp.setDataSource(file.absolutePath)
+                      mp.prepare()
+                      val dev = findOutput(toEarphones)
+                      if (dev != null) {
+                          mp.setPreferredDevice(dev)
+                      } else if (toEarphones) {
+                          status("No earphones found. Playing on the phone speaker.")
+                      }
+                      mp.setOnCompletionListener { m ->
+                          m.release()
+                          if (player === m) player = null
+                          file.delete()
+                          done()
+                      }
+                      mp.setOnErrorListener { m, _, _ ->
+                          m.release()
+                          if (player === m) player = null
+                          file.delete()
+                          done()
+                          true
+                      }
+                      mp.start()
+                  } catch (e: Exception) {
+                      try { mp.release() } catch (e: Exception) {}
+                      if (player === mp) player = null
+                      file.delete()
+                      done()
+                  }
+              }
+          }
+          BOLO_EOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build the APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Keep the APK as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bolo-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish the APK as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Bolo build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
